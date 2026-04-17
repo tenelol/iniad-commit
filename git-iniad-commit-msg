@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import NoReturn
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+TYPE_TO_EMOJI = {
+    "chore": "🧹",
+    "docs": "📝",
+    "feat": "✨",
+    "fix": "🐛",
+    "refactor": "♻️",
+    "style": "💄",
+    "test": "✅",
+}
+
+DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.iniad.org/api/v1")
+DEFAULT_MODEL = os.environ.get("INIAD_OPENAI_MODEL", "gpt-5.4")
+DEFAULT_PATCH_LIMIT = 12000
+DEFAULT_KEYCHAIN_SERVICE = os.environ.get("INIAD_OPENAI_KEYCHAIN_SERVICE", "iniad-openai-api")
+MESSAGE_RE = re.compile(r"^(chore|docs|feat|fix|refactor|style|test): (\S+) (.+)$")
+
+
+class InvalidApiKeyError(Exception):
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"INIAD API request failed: HTTP {status_code}\n{detail}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a Semantic Commit Message with the INIAD OpenAI API."
+    )
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="Run git commit -m with the generated message.",
+    )
+    parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="Use only staged changes even if the working tree also has unstaged changes.",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Model name to send to the API (default: {DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help=f"API base URL (default: {DEFAULT_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--max-patch-chars",
+        type=int,
+        default=DEFAULT_PATCH_LIMIT,
+        help=f"Maximum diff characters to send to the API (default: {DEFAULT_PATCH_LIMIT}).",
+    )
+    return parser.parse_args()
+
+
+def die(message: str, exit_code: int = 1) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def run_git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *args],
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        die(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result
+
+
+def run_command(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        text=True,
+        capture_output=True,
+    )
+
+
+def can_prompt() -> bool:
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def ensure_git_repo() -> None:
+    result = run_git("rev-parse", "--is-inside-work-tree", check=False)
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        die("Not inside a Git repository.")
+
+
+def has_diff(*args: str) -> bool:
+    result = run_git(*args, check=False)
+    return result.returncode == 1
+
+
+def trim_block(label: str, text: str, limit: int) -> str:
+    text = text.strip()
+    if not text:
+        return f"{label}:\n<empty>"
+    if len(text) <= limit:
+        return f"{label}:\n{text}"
+    clipped = text[:limit].rstrip()
+    return f"{label}:\n{clipped}\n... [truncated at {limit} chars]"
+
+
+def collect_git_context(staged_only: bool, max_patch_chars: int) -> str:
+    status = run_git("status", "--short", "--branch").stdout
+    staged_changes = has_diff("diff", "--cached", "--quiet")
+    unstaged_changes = has_diff("diff", "--quiet")
+    untracked = run_git("ls-files", "--others", "--exclude-standard").stdout.strip()
+
+    if staged_only:
+        if not staged_changes:
+            if untracked:
+                die("No staged diff found. Stage new files first, then run the command again.")
+            die("No staged changes found.")
+        diff_args = ["diff", "--cached", "--no-color", "--unified=1"]
+        stat_args = ["diff", "--cached", "--stat", "--no-color"]
+        scope = "staged changes"
+    elif staged_changes:
+        diff_args = ["diff", "--cached", "--no-color", "--unified=1"]
+        stat_args = ["diff", "--cached", "--stat", "--no-color"]
+        scope = "staged changes"
+    elif unstaged_changes:
+        diff_args = ["diff", "--no-color", "--unified=1"]
+        stat_args = ["diff", "--stat", "--no-color"]
+        scope = "working tree changes"
+    else:
+        if untracked:
+            die("No tracked diff found. Stage new files first so the command can inspect them.")
+        die("No changes found.")
+
+    name_status_args = ["diff", *diff_args[1:-1], "--name-status"]
+
+    patch = run_git(*diff_args).stdout
+    stat = run_git(*stat_args).stdout
+    name_status = run_git(*name_status_args).stdout
+    top_level = run_git("rev-parse", "--show-toplevel").stdout.strip()
+
+    sections = [
+        f"Repository root: {top_level}",
+        f"Scope: {scope}",
+        trim_block("Git status", status, 3000),
+        trim_block("Changed files", name_status, 3000),
+        trim_block("Diff stat", stat, 4000),
+        trim_block("Patch", patch, max_patch_chars),
+    ]
+    return "\n\n".join(sections)
+
+
+def build_messages(context: str, invalid_response: str | None = None) -> list[dict[str, str]]:
+    rules = [
+        "You write exactly one Git commit message line.",
+        "Follow this format exactly: <Type>: <Emoji> <Title>.",
+        "Type must be one of: chore, docs, feat, fix, refactor, style, test.",
+        "Use this emoji mapping exactly:",
+        "chore -> 🧹",
+        "docs -> 📝",
+        "feat -> ✨",
+        "fix -> 🐛",
+        "refactor -> ♻️",
+        "style -> 💄",
+        "test -> ✅",
+        "The title must be concise and written in imperative present tense.",
+        "Return only the commit message. No backticks. No explanation. No surrounding quotes.",
+        "Use the diff to choose the most accurate type and title.",
+    ]
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": "\n".join(rules)},
+        {
+            "role": "user",
+            "content": (
+                "Generate a commit message for these changes.\n\n"
+                "The repository style follows ~/.dotfiles/AGENTS.md and requires the "
+                "Semantic Commit Message format described above.\n\n"
+                f"{context}"
+            ),
+        },
+    ]
+    if invalid_response:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": invalid_response,
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "The previous response was invalid. Return exactly one valid commit "
+                    "message line and obey the required emoji mapping."
+                ),
+            }
+        )
+    return messages
+
+
+def request_commit_message(
+    api_key: str, base_url: str, model: str, context: str
+) -> str:
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    invalid_response: str | None = None
+
+    for _ in range(2):
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": 64,
+            "messages": build_messages(context, invalid_response=invalid_response),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            if error.code in {401, 403}:
+                raise InvalidApiKeyError(error.code, detail)
+            die(f"INIAD API request failed: HTTP {error.code}\n{detail}")
+        except URLError as error:
+            die(f"INIAD API request failed: {error.reason}")
+
+        try:
+            message = data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError):
+            die(f"Unexpected API response:\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+
+        validation_error = validate_message(message)
+        if validation_error is None:
+            return message
+        invalid_response = message
+
+    die(f"Model returned an invalid commit message: {invalid_response}")
+
+
+def validate_message(message: str) -> str | None:
+    if "\n" in message:
+        return "message must be a single line"
+    match = MESSAGE_RE.fullmatch(message.strip())
+    if match is None:
+        return "message does not match <Type>: <Emoji> <Title>"
+    commit_type, emoji, title = match.groups()
+    if emoji != TYPE_TO_EMOJI[commit_type]:
+        return "message uses the wrong emoji for the chosen type"
+    if not title.strip():
+        return "title is empty"
+    return None
+
+
+def store_api_key_in_keychain(api_key: str) -> None:
+    result = run_command(
+        "security",
+        "add-generic-password",
+        "-U",
+        "-a",
+        os.environ.get("USER", "user"),
+        "-s",
+        DEFAULT_KEYCHAIN_SERVICE,
+        "-w",
+        api_key,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        die(f"Failed to save API key to macOS Keychain: {detail}")
+
+
+def delete_api_key_from_keychain() -> None:
+    result = run_command(
+        "security",
+        "delete-generic-password",
+        "-s",
+        DEFAULT_KEYCHAIN_SERVICE,
+    )
+    if result.returncode not in {0, 44}:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        die(f"Failed to delete API key from macOS Keychain: {detail}")
+
+
+def prompt_for_api_key(reason: str | None = None) -> str:
+    if not can_prompt():
+        die(
+            "OPENAI_API_KEY is not set, and no macOS Keychain item was found.\n"
+            f"Set OPENAI_API_KEY or add one with:\n"
+            f"security add-generic-password -U -a \"$USER\" -s {DEFAULT_KEYCHAIN_SERVICE} -w '<API_KEY>'"
+        )
+
+    if reason:
+        print(reason, file=sys.stderr)
+    else:
+        print(
+            "INIAD OpenAI API key not found.",
+            file=sys.stderr,
+        )
+    print(
+        "Issue a key from the INIAD workspace bot with `apikey issue`, then paste it below.",
+        file=sys.stderr,
+    )
+    api_key = getpass.getpass("INIAD OpenAI API key: ").strip()
+    if not api_key:
+        die("No API key entered.")
+    store_api_key_in_keychain(api_key)
+    print(
+        f"Saved API key to macOS Keychain service `{DEFAULT_KEYCHAIN_SERVICE}`.",
+        file=sys.stderr,
+    )
+    return api_key
+
+
+def resolve_api_key() -> tuple[str, str]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return api_key, "env"
+
+    security = run_command(
+        "security",
+        "find-generic-password",
+        "-s",
+        DEFAULT_KEYCHAIN_SERVICE,
+        "-w",
+    )
+    if security.returncode == 0:
+        api_key = security.stdout.strip()
+        if api_key:
+            return api_key, "keychain"
+
+    return prompt_for_api_key(), "prompt"
+
+
+def handle_invalid_api_key(source: str, error: InvalidApiKeyError) -> tuple[str, str]:
+    if source == "env":
+        die(
+            "OPENAI_API_KEY is set, but the INIAD API rejected it.\n"
+            f"HTTP {error.status_code}\n{error.detail}"
+        )
+
+    delete_api_key_from_keychain()
+
+    if not can_prompt():
+        die(
+            "The saved macOS Keychain API key was rejected and has been deleted.\n"
+            "Run the command again in an interactive terminal to enter a new key."
+        )
+
+    return (
+        prompt_for_api_key(
+            "The saved INIAD OpenAI API key was rejected. Enter a new key to replace it."
+        ),
+        "prompt",
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    ensure_git_repo()
+    context = collect_git_context(args.staged, args.max_patch_chars)
+    api_key, api_key_source = resolve_api_key()
+
+    while True:
+        try:
+            message = request_commit_message(api_key, args.base_url, args.model, context)
+            break
+        except InvalidApiKeyError as error:
+            api_key, api_key_source = handle_invalid_api_key(api_key_source, error)
+
+    if args.commit:
+        run_git("commit", "-m", message)
+        print(message)
+        return
+
+    print(message)
+
+
+if __name__ == "__main__":
+    main()

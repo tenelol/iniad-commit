@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python_bin="${GIT_AUTO_COMMIT_PYTHON:-python3}"
+script_path="${GIT_AUTO_COMMIT_SCRIPT:-$script_dir/git-iniad-commit-msg}"
+
+exec "$python_bin" "$script_path" --commit "$@"
