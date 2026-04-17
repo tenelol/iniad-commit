@@ -308,12 +308,13 @@ def request_commit_message(
 ) -> str:
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
     invalid_response: str | None = None
+    completion_token_field = "max_completion_tokens" if model.startswith("gpt-5") else "max_tokens"
 
     for _ in range(2):
         payload = {
             "model": model,
             "temperature": 0.2,
-            "max_tokens": 64,
+            completion_token_field: 64,
             "messages": build_messages(
                 context, style_config, invalid_response=invalid_response
             ),
@@ -336,6 +337,21 @@ def request_commit_message(
             detail = error.read().decode("utf-8", errors="replace")
             if error.code in {401, 403}:
                 raise InvalidApiKeyError(error.code, detail)
+            if (
+                error.code == 400
+                and completion_token_field == "max_tokens"
+                and "max_completion_tokens" in detail
+            ):
+                completion_token_field = "max_completion_tokens"
+                continue
+            if (
+                error.code == 400
+                and completion_token_field == "max_completion_tokens"
+                and "max_tokens" in detail
+                and "unsupported_parameter" in detail
+            ):
+                completion_token_field = "max_tokens"
+                continue
             die(f"INIAD API request failed: HTTP {error.code}\n{detail}")
         except URLError as error:
             die(f"INIAD API request failed: {error.reason}")
