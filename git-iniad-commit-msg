@@ -8,7 +8,8 @@ import os
 import re
 import subprocess
 import sys
-from typing import NoReturn
+from pathlib import Path
+from typing import Any, NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -26,7 +27,30 @@ DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.iniad.o
 DEFAULT_MODEL = os.environ.get("INIAD_OPENAI_MODEL", "gpt-5.4")
 DEFAULT_PATCH_LIMIT = 12000
 DEFAULT_KEYCHAIN_SERVICE = os.environ.get("INIAD_OPENAI_KEYCHAIN_SERVICE", "iniad-openai-api")
-MESSAGE_RE = re.compile(r"^(chore|docs|feat|fix|refactor|style|test): (\S+) (.+)$")
+DEFAULT_STYLE_CONFIG = {
+    "format": "<Type>: <Emoji> <Title>",
+    "system_rules": [
+        "Type must be one of: chore, docs, feat, fix, refactor, style, test.",
+        "Use this emoji mapping exactly:",
+        "chore -> 🧹",
+        "docs -> 📝",
+        "feat -> ✨",
+        "fix -> 🐛",
+        "refactor -> ♻️",
+        "style -> 💄",
+        "test -> ✅",
+        "The title must be concise and written in imperative present tense.",
+    ],
+    "retry_prompt": (
+        "The previous response was invalid. Return exactly one valid commit "
+        "message line and obey the required format."
+    ),
+    "validation_regex": r"^(chore|docs|feat|fix|refactor|style|test): (\S+) (.+)$",
+    "type_emoji_map": TYPE_TO_EMOJI,
+    "type_capture_group": 1,
+    "emoji_capture_group": 2,
+    "title_capture_group": 3,
+}
 
 
 class InvalidApiKeyError(Exception):
@@ -34,6 +58,13 @@ class InvalidApiKeyError(Exception):
         self.status_code = status_code
         self.detail = detail
         super().__init__(f"INIAD API request failed: HTTP {status_code}\n{detail}")
+
+
+def default_style_path() -> Path:
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home).expanduser() / "iniad-commit" / "style.json"
+    return Path.home() / ".config" / "iniad-commit" / "style.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +97,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PATCH_LIMIT,
         help=f"Maximum diff characters to send to the API (default: {DEFAULT_PATCH_LIMIT}).",
     )
+    parser.add_argument(
+        "--config",
+        help=(
+            "Path to a JSON style config. Defaults to "
+            f"{default_style_path()} when that file exists."
+        ),
+    )
+    parser.add_argument(
+        "--print-default-style",
+        action="store_true",
+        help="Print the default style JSON and exit.",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +138,65 @@ def run_command(*args: str) -> subprocess.CompletedProcess[str]:
 
 def can_prompt() -> bool:
     return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def load_style_config(config_arg: str | None) -> dict[str, Any]:
+    style = dict(DEFAULT_STYLE_CONFIG)
+    style["type_emoji_map"] = dict(TYPE_TO_EMOJI)
+
+    config_path: Path | None
+    if config_arg:
+        config_path = Path(config_arg).expanduser()
+        if not config_path.exists():
+            die(f"Style config not found: {config_path}")
+    else:
+        env_path = os.environ.get("INIAD_COMMIT_STYLE_FILE")
+        if env_path:
+            config_path = Path(env_path).expanduser()
+            if not config_path.exists():
+                die(f"Style config not found: {config_path}")
+        else:
+            default_path = default_style_path()
+            config_path = default_path if default_path.exists() else None
+
+    if config_path is None:
+        return style
+
+    try:
+        custom = json.loads(config_path.read_text(encoding="utf-8"))
+    except OSError as error:
+        die(f"Failed to read style config {config_path}: {error}")
+    except json.JSONDecodeError as error:
+        die(f"Invalid JSON in style config {config_path}: {error}")
+
+    if not isinstance(custom, dict):
+        die(f"Style config {config_path} must contain a JSON object at the top level.")
+
+    style.update(custom)
+    if "type_emoji_map" in custom:
+        if custom["type_emoji_map"] is None:
+            style["type_emoji_map"] = {}
+        elif not isinstance(custom["type_emoji_map"], dict):
+            die(f"Style config {config_path} field `type_emoji_map` must be an object.")
+        else:
+            style["type_emoji_map"] = custom["type_emoji_map"]
+
+    required_string_fields = ["format", "retry_prompt", "validation_regex"]
+    for field in required_string_fields:
+        value = style.get(field)
+        if not isinstance(value, str) or not value.strip():
+            die(f"Style config field `{field}` must be a non-empty string.")
+
+    system_rules = style.get("system_rules")
+    if not isinstance(system_rules, list) or not all(isinstance(rule, str) for rule in system_rules):
+        die("Style config field `system_rules` must be an array of strings.")
+
+    try:
+        re.compile(style["validation_regex"])
+    except re.error as error:
+        die(f"Invalid validation_regex in style config: {error}")
+
+    return style
 
 
 def ensure_git_repo() -> None:
@@ -163,20 +265,13 @@ def collect_git_context(staged_only: bool, max_patch_chars: int) -> str:
     return "\n\n".join(sections)
 
 
-def build_messages(context: str, invalid_response: str | None = None) -> list[dict[str, str]]:
+def build_messages(
+    context: str, style_config: dict[str, Any], invalid_response: str | None = None
+) -> list[dict[str, str]]:
     rules = [
         "You write exactly one Git commit message line.",
-        "Follow this format exactly: <Type>: <Emoji> <Title>.",
-        "Type must be one of: chore, docs, feat, fix, refactor, style, test.",
-        "Use this emoji mapping exactly:",
-        "chore -> 🧹",
-        "docs -> 📝",
-        "feat -> ✨",
-        "fix -> 🐛",
-        "refactor -> ♻️",
-        "style -> 💄",
-        "test -> ✅",
-        "The title must be concise and written in imperative present tense.",
+        f"Follow this format exactly: {style_config['format']}.",
+        *style_config["system_rules"],
         "Return only the commit message. No backticks. No explanation. No surrounding quotes.",
         "Use the diff to choose the most accurate type and title.",
     ]
@@ -187,7 +282,7 @@ def build_messages(context: str, invalid_response: str | None = None) -> list[di
             "content": (
                 "Generate a commit message for these changes.\n\n"
                 "The repository style follows ~/.dotfiles/AGENTS.md and requires the "
-                "Semantic Commit Message format described above.\n\n"
+                "configured commit message format described above.\n\n"
                 f"{context}"
             ),
         },
@@ -202,17 +297,14 @@ def build_messages(context: str, invalid_response: str | None = None) -> list[di
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "The previous response was invalid. Return exactly one valid commit "
-                    "message line and obey the required emoji mapping."
-                ),
+                "content": style_config["retry_prompt"],
             }
         )
     return messages
 
 
 def request_commit_message(
-    api_key: str, base_url: str, model: str, context: str
+    api_key: str, base_url: str, model: str, context: str, style_config: dict[str, Any]
 ) -> str:
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
     invalid_response: str | None = None
@@ -222,7 +314,9 @@ def request_commit_message(
             "model": model,
             "temperature": 0.2,
             "max_tokens": 64,
-            "messages": build_messages(context, invalid_response=invalid_response),
+            "messages": build_messages(
+                context, style_config, invalid_response=invalid_response
+            ),
         }
         body = json.dumps(payload).encode("utf-8")
         request = Request(
@@ -251,7 +345,7 @@ def request_commit_message(
         except (KeyError, IndexError, TypeError):
             die(f"Unexpected API response:\n{json.dumps(data, ensure_ascii=False, indent=2)}")
 
-        validation_error = validate_message(message)
+        validation_error = validate_message(message, style_config)
         if validation_error is None:
             return message
         invalid_response = message
@@ -259,17 +353,36 @@ def request_commit_message(
     die(f"Model returned an invalid commit message: {invalid_response}")
 
 
-def validate_message(message: str) -> str | None:
+def validate_message(message: str, style_config: dict[str, Any]) -> str | None:
     if "\n" in message:
         return "message must be a single line"
-    match = MESSAGE_RE.fullmatch(message.strip())
+
+    validation_regex = style_config["validation_regex"]
+    match = re.fullmatch(validation_regex, message.strip())
     if match is None:
-        return "message does not match <Type>: <Emoji> <Title>"
-    commit_type, emoji, title = match.groups()
-    if emoji != TYPE_TO_EMOJI[commit_type]:
-        return "message uses the wrong emoji for the chosen type"
-    if not title.strip():
-        return "title is empty"
+        return f"message does not match {validation_regex}"
+
+    type_emoji_map = style_config.get("type_emoji_map") or {}
+    if type_emoji_map:
+        try:
+            commit_type = match.group(int(style_config.get("type_capture_group", 1)))
+            emoji = match.group(int(style_config.get("emoji_capture_group", 2)))
+        except (IndexError, ValueError):
+            die("Style config capture groups for type/emoji are invalid.")
+
+        expected_emoji = type_emoji_map.get(commit_type)
+        if expected_emoji and emoji != expected_emoji:
+            return "message uses the wrong emoji for the chosen type"
+
+    title_capture_group = style_config.get("title_capture_group")
+    if title_capture_group is not None:
+        try:
+            title = match.group(int(title_capture_group))
+        except (IndexError, ValueError):
+            die("Style config title_capture_group is invalid.")
+        if not title.strip():
+            return "title is empty"
+
     return None
 
 
@@ -377,13 +490,20 @@ def handle_invalid_api_key(source: str, error: InvalidApiKeyError) -> tuple[str,
 
 def main() -> None:
     args = parse_args()
+    if args.print_default_style:
+        print(json.dumps(DEFAULT_STYLE_CONFIG, ensure_ascii=False, indent=2))
+        return
+
+    style_config = load_style_config(args.config)
     ensure_git_repo()
     context = collect_git_context(args.staged, args.max_patch_chars)
     api_key, api_key_source = resolve_api_key()
 
     while True:
         try:
-            message = request_commit_message(api_key, args.base_url, args.model, context)
+            message = request_commit_message(
+                api_key, args.base_url, args.model, context, style_config
+            )
             break
         except InvalidApiKeyError as error:
             api_key, api_key_source = handle_invalid_api_key(api_key_source, error)
